@@ -1,5 +1,5 @@
 # -- coding: utf-8 --
-# Medicine Recommendation System (with user input)
+# Medicine Recommendation System (with user input, voice input, and chatbot interface)
 
 # Step 1: Import libraries
 import os
@@ -9,9 +9,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoTokenizer, AutoModel, GPT2Tokenizer, GPT2LMHeadModel, Trainer, TrainingArguments
 from datasets import Dataset
 import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import speech_recognition as sr  # For voice input
+import gradio as gr  # For chatbot interface
 
 # Step 2: Dataset path
-dataset = r"finalmedicine_dataset.csv" 
+dataset = r"finalmedicine_dataset.csv"
 
 # Step 3: Load and preprocess the dataset
 def load_dataset(file_path):
@@ -50,15 +54,21 @@ data["text"] = (
     + "Classification: " + data["classification"]
 )
 
-# Step 5: Generate embeddings
-def generate_embeddings(data, column, tokenizer, model):
+# Step 5: Generate embeddings (batched with attention masking)
+def generate_embeddings(data, column, tokenizer, model, batch_size=16):
+    model.eval()
     embeddings = []
-    for text in data[column]:
-        inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
-        with torch.no_grad():
+
+    dataloader = DataLoader(data[column].tolist(), batch_size=batch_size)
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Generating Embeddings"):
+            inputs = tokenizer(batch, return_tensors="pt", padding=True, truncation=True, max_length=128)
             outputs = model(**inputs)
-        sentence_embedding = outputs.last_hidden_state.mean(dim=1).numpy()
-        embeddings.append(sentence_embedding[0])
+            attention_mask = inputs["attention_mask"].unsqueeze(-1)
+            masked_output = outputs.last_hidden_state * attention_mask
+            sentence_embeddings = masked_output.sum(dim=1) / attention_mask.sum(dim=1)
+            embeddings.extend(sentence_embeddings.cpu().numpy())
+    
     return np.array(embeddings)
 
 # Load DistilBERT once
@@ -70,72 +80,85 @@ embeddings = generate_embeddings(data, "text", tokenizer, model)
 
 # Step 6: Recommend medicines
 def recommend_medicines(user_query, data, embeddings, tokenizer, model, top_n=5):
-    inputs = tokenizer(user_query, return_tensors="pt", padding=True, truncation=True)
+    inputs = tokenizer(user_query, return_tensors="pt", padding="max_length", truncation=True, max_length=128)
     with torch.no_grad():
         outputs = model(**inputs)
-    user_embedding = outputs.last_hidden_state.mean(dim=1).numpy()
+        attention_mask = inputs["attention_mask"].unsqueeze(-1)
+        masked_output = outputs.last_hidden_state * attention_mask
+        user_embedding = masked_output.sum(dim=1) / attention_mask.sum(dim=1)
 
-    similarities = cosine_similarity(user_embedding, embeddings)
+    similarities = cosine_similarity(user_embedding.cpu().numpy(), embeddings)
     top_indices = similarities[0].argsort()[-top_n:][::-1]
 
     return data.iloc[top_indices]
 
-# Step 7: Main function
-def main():
-    user_query = input("Enter the disease or condition to get medicine recommendations: ")
-    print(f"\nGenerating recommendations for: {user_query}\n")
+# Step 7: Side Effects Predictor (Simulation)
+def predict_side_effects(medicine_name):
+    # Simple simulated side effect data
+    side_effects = {
+        "Aspirin": ["Nausea", "Vomiting", "Rash"],
+        "Ibuprofen": ["Dizziness", "Headache", "Stomach pain"],
+        "Paracetamol": ["Liver damage (overuse)", "Nausea"],
+        "Amoxicillin": ["Diarrhea", "Rash", "Allergic reaction"],
+        # Add more medicines and their side effects here
+    }
 
-    recommendations = recommend_medicines(user_query, data, embeddings, tokenizer, model, top_n=5)
+    return side_effects.get(medicine_name, ["No known side effects"])
 
-    print("Top Recommendations:\n")
-    print(recommendations[["name", "category", "indication"]].to_string(index=False))
+# Step 8: Voice Input Functionality
+def voice_input():
+    recognizer = sr.Recognizer()
+    with sr.Microphone() as source:
+        print("Say something...")
+        audio = recognizer.listen(source)
+        try:
+            text = recognizer.recognize_google(audio)
+            print(f"You said: {text}")
+            return text
+        except sr.UnknownValueError:
+            print("Could not understand audio")
+            return ""
+        except sr.RequestError:
+            print("Could not request results from Google Speech Recognition service")
+            return ""
 
-# Step 8: (Optional) Fine-tune GPT-2
-def fine_tune_gpt2(data):
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2-medium")
-    tokenizer.pad_token = tokenizer.eos_token
+# Step 9: Main function (for chatbot interface)
+def chatbot_interface(query):
+    if not query:
+        return "Please enter a valid condition."
+    recs = recommend_medicines(query, data, embeddings, tokenizer, model, top_n=5)
+    output = ""
+    for _, row in recs.iterrows():
+        output += f"**{row['name']}** (Category: {row['category']})\n"
+        se = predict_side_effects(row['name'])
+        output += f"Side Effects: {', '.join(se)}\n\n"
+    return output
 
-    hf_dataset = Dataset.from_pandas(data[["text"]])
-
-    def tokenize_function(examples):
-        tokenized = tokenizer(examples["text"], padding="max_length", truncation=True, max_length=512)
-        tokenized["labels"] = tokenized["input_ids"].copy()
-        return tokenized
-
-    tokenized_dataset = hf_dataset.map(tokenize_function, batched=True)
-    model = GPT2LMHeadModel.from_pretrained("gpt2-medium")
-
-    training_args = TrainingArguments(
-        output_dir="./results",
-        overwrite_output_dir=True,
-        num_train_epochs=1,
-        per_device_train_batch_size=2,
-        save_steps=10000,
-        save_total_limit=2,
-        logging_dir="./logs",
-        logging_steps=500,
-        evaluation_strategy="no",
-        learning_rate=5e-5,
-        weight_decay=0.01,
-        fp16=torch.cuda.is_available(),
-        report_to="none"
+# Step 10: Gradio Interface (Chatbot + Voice Input)
+def run_gradio_interface():
+    interface = gr.Interface(
+        fn=chatbot_interface,
+        inputs=gr.Textbox(
+            lines=1,
+            placeholder="Enter disease/condition, e.g., fever...",
+            label="Your Query"
+        ),
+        outputs=gr.Textbox(
+            lines=10,
+            label="Recommendations & Side Effects"
+        ),
+        title="🩺 Medicine Recommendation System",
+        description="Type in a disease or condition to get top medicine recommendations along with common side effects."
     )
-
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=tokenized_dataset,
-        tokenizer=tokenizer,
-    )
-
-    trainer.train()
-    model.save_pretrained("medicine_recommendation_model")
-    tokenizer.save_pretrained("medicine_recommendation_model")
-
-    print("Model fine-tuning complete. Saved to 'medicine_recommendation_model'.")
+    interface.launch()
 
 # Run the script
 if __name__ == "__main__":
-    main()
-    # Uncomment to run fine-tuning
-    # fine_tune_gpt2(data)
+    print("Starting the Medicine Recommendation System...\n")
+    
+    # Start the Gradio chatbot interface
+    run_gradio_interface()
+
+    # To enable voice input, you can uncomment the following line to test voice recognition:
+    # query = voice_input()  # This will allow you to input via voice
+    # print(f"Voice Input: {query}")
