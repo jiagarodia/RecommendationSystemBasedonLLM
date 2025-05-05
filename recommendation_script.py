@@ -11,7 +11,7 @@ from datasets import Dataset
 import torch
 
 # Step 2: Dataset path
-dataset = r"script\finalmedicine_dataset.csv" 
+dataset = r"finalmedicine_dataset.csv" 
 
 # Step 3: Load and preprocess the dataset
 def load_dataset(file_path):
